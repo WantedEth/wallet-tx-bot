@@ -11,22 +11,14 @@ const WALLET_FILE = './wallets.json';
 const CHAINS_FILE = './chains.json';
 const CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
-// ============ INIT BOT ============
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
 // Load wallets
 let wallets = fs.existsSync(WALLET_FILE) ? fs.readJsonSync(WALLET_FILE) : [];
 wallets = wallets.map(w => ({ address: w.address || w, lastTx: w.lastTx || {} }));
 
 // Load chains
-let chains = fs.existsSync(CHAINS_FILE) ? fs.readJsonSync(CHAINS_FILE) : [
-    { name: "Ethereum", explorer: "https://etherscan.io/address/", selector: ".u-label" },
-    { name: "BSC", explorer: "https://bscscan.com/address/", selector: ".u-label" },
-    { name: "Polygon", explorer: "https://polygonscan.com/address/", selector: ".u-label" },
-    { name: "Base", explorer: "https://basescan.org/address/", selector: ".u-label" }
-];
+let chains = fs.existsSync(CHAINS_FILE) ? fs.readJsonSync(CHAINS_FILE) : [];
 
-// ============ HELPERS ============
+// ============ HELPER FUNCTIONS ============
 function saveWallets() {
     fs.writeJsonSync(WALLET_FILE, wallets, { spaces: 2 });
 }
@@ -40,7 +32,7 @@ async function getTxCount(wallet, chain) {
     try {
         const { data } = await axios.get(chain.explorer + wallet);
         const $ = cheerio.load(data);
-        const txText = $(chain.selector).first().text();
+        const txText = $(chain.selector).text();
         return parseInt(txText.replace(/[^0-9]/g, '') || 0);
     } catch (e) {
         console.error(`Error fetching ${chain.name} tx count for ${wallet}:`, e.message);
@@ -68,34 +60,41 @@ async function sendAlert(wallet, txs, delta) {
     await bot.sendMessage(ALERT_CHANNEL, msg);
 }
 
-// ============ REAL-TIME WALLET DETECTION ============
-bot.on('message', async (msg) => {
-    if (msg.chat.id === SOURCE_CHANNEL) {
-        const walletAddr = extractAddress(msg.text);
-        if (walletAddr && !wallets.some(w => w.address === walletAddr)) {
-            wallets.push({ address: walletAddr, lastTx: {} });
-            saveWallets();
-            console.log('Saved new wallet:', walletAddr);
+// ============ INIT BOT WITH RECONNECT ============
+let bot;
 
-            // Immediately check transactions
-            const txs = await checkWallet({ address: walletAddr, lastTx: {} });
-            const delta = {};
-            for (let chain of chains) {
-                delta[chain.name] = txs[chain.name];
-            }
-            const hasNewTx = Object.values(delta).some(v => v > 0);
-            if (hasNewTx) {
-                await sendAlert(walletAddr, txs, delta);
-                wallets.find(w => w.address === walletAddr).lastTx = txs;
+function startBot() {
+    bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+    bot.on('polling_error', async (err) => {
+        if (err.code === 'ETELEGRAM' && err.response?.description?.includes('terminated by other getUpdates request')) {
+            console.warn('⚠️ 409 Conflict detected, restarting bot...');
+            bot.stopPolling();
+            setTimeout(startBot, 5000); // restart after 5 sec
+        } else {
+            console.error('Polling error:', err);
+        }
+    });
+
+    // Listen to source channel
+    bot.on('message', async (msg) => {
+        if (msg.chat.id === SOURCE_CHANNEL) {
+            const walletAddr = extractAddress(msg.text);
+            if (walletAddr && !wallets.some(w => w.address === walletAddr)) {
+                wallets.push({ address: walletAddr, lastTx: {} });
                 saveWallets();
+                console.log('Saved new wallet:', walletAddr);
             }
         }
-    }
-});
+    });
 
-// ============ PERIODIC CHECK FOR EXISTING WALLETS ============
+    console.log('Bot started ✅ Listening to source channel...');
+}
+
+startBot();
+
+// ============ PERIODIC CHECK ============
 setInterval(async () => {
-    console.log("Checking all wallets...");
     for (let w of wallets) {
         const txs = await checkWallet(w);
         const delta = {};
@@ -103,6 +102,7 @@ setInterval(async () => {
             const last = w.lastTx[chain.name] || 0;
             delta[chain.name] = txs[chain.name] - last;
         }
+
         const hasNewTx = Object.values(delta).some(v => v > 0);
         if (hasNewTx) {
             await sendAlert(w.address, txs, delta);
@@ -110,7 +110,4 @@ setInterval(async () => {
             saveWallets();
         }
     }
-    console.log('Periodic check finished ✅');
 }, CHECK_INTERVAL);
-
-console.log("Bot started ✅ Listening to source channel...");
